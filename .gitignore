@@ -18,10 +18,13 @@ go.work
 proxy-quality-tester
 /bin/
 /dist/
+/out/
 
 # Sensitive data files
 *.txt
 *.csv
+*.log
+*.sh
 
 # IDE
 .claude/
