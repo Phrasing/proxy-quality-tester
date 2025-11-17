@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -64,7 +65,6 @@ type CurlRequest struct {
 const (
 	defaultInputFile     = "proxies.txt"
 	defaultOutputFile    = "results.csv"
-	defaultWorkers       = 512
 	defaultTimeout       = 5
 	defaultMaxFraudScore = 0.0005
 )
@@ -72,7 +72,6 @@ const (
 var (
 	inputFile      string
 	outputFile     string
-	numWorkers     int
 	requestTimeout int
 	maxFraudScore  float64
 	requestFile    string
@@ -85,7 +84,6 @@ var (
 func init() {
 	flag.StringVar(&inputFile, "input", defaultInputFile, "Input file containing proxies")
 	flag.StringVar(&outputFile, "output", defaultOutputFile, "Output CSV file for results")
-	flag.IntVar(&numWorkers, "workers", defaultWorkers, "Number of concurrent workers")
 	flag.IntVar(&requestTimeout, "timeout", defaultTimeout, "Request timeout in seconds")
 	flag.Float64Var(&maxFraudScore, "max-fraud-score", defaultMaxFraudScore, "Maximum acceptable fraud score")
 	flag.StringVar(&requestFile, "request", "request.txt", "File containing curl command to test proxies against")
@@ -170,7 +168,7 @@ func testProxiesAgainstTarget(proxies []ProxyResult, curlReq CurlRequest) []Prox
 	defer cancel()
 
 	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < len(proxies); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -242,7 +240,7 @@ func testProxies(proxies []string) ([]ProxyResult, Stats) {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < len(proxies); i++ {
 		wg.Add(1)
 		go worker(ctx, proxyQueue, results, &wg)
 	}
@@ -338,7 +336,7 @@ func writeCSVFile(filename string, proxies []ProxyResult) error {
 			p.City,
 			fmt.Sprintf("%d", p.ASN),
 			p.ASNOrg,
-			fmt.Sprintf("%.4f", p.FraudScore),
+			fmt.Sprintf("%.1f", p.FraudScore*1000),
 		}
 		if err := w.Write(record); err != nil {
 			return err
@@ -549,48 +547,87 @@ func applyHeaders(req *http.Request, headers http.Header) {
 	}
 }
 
-func writeLog(msg string) {
+type logEntry struct {
+	Proxy    string       `json:"proxy"`
+	Time     string       `json:"time"`
+	Request  logReq       `json:"request"`
+	Response *logResp     `json:"response,omitempty"`
+}
+
+type logReq struct {
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body,omitempty"`
+}
+
+type logResp struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body,omitempty"`
+}
+
+var pendingRequests sync.Map
+
+func logRequest(proxy string, req *http.Request, reqBody string) {
 	if !debugLog {
 		return
 	}
-	logMutex.Lock()
-	defer logMutex.Unlock()
-	if f, err := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-		f.WriteString(msg)
-		f.Close()
-	}
-}
-
-func logRequest(proxy string, req *http.Request, reqBody string) {
-	var msg strings.Builder
-	msg.WriteString("\n========== REQUEST ==========\n")
-	msg.WriteString(fmt.Sprintf("Proxy: %s\nTime: %s\n%s %s\nHeaders:\n",
-		proxy, time.Now().Format(time.RFC3339), req.Method, req.URL.String()))
+	headers := make(map[string]string)
 	for k, v := range req.Header {
-		msg.WriteString(fmt.Sprintf("  %s: %s\n", k, strings.Join(v, ", ")))
+		headers[k] = strings.Join(v, ", ")
 	}
-	if reqBody != "" {
-		msg.WriteString("Body: " + reqBody + "\n")
+	entry := &logEntry{
+		Proxy: proxy,
+		Time:  time.Now().Format(time.RFC3339),
+		Request: logReq{
+			Method:  req.Method,
+			URL:     req.URL.String(),
+			Headers: headers,
+			Body:    reqBody,
+		},
 	}
-	writeLog(msg.String())
+	pendingRequests.Store(proxy, entry)
 }
 
 func logResponse(proxy string, resp *http.Response, body []byte) {
-	var msg strings.Builder
-	msg.WriteString(fmt.Sprintf("\n---------- RESPONSE ----------\nProxy: %s\nStatus: %d %s\nHeaders:\n",
-		proxy, resp.StatusCode, resp.Status))
+	if !debugLog {
+		return
+	}
+	val, ok := pendingRequests.LoadAndDelete(proxy)
+	if !ok {
+		return
+	}
+	entry := val.(*logEntry)
+
+	headers := make(map[string]string)
 	for k, v := range resp.Header {
-		msg.WriteString(fmt.Sprintf("  %s: %s\n", k, strings.Join(v, ", ")))
+		headers[k] = strings.Join(v, ", ")
 	}
-	if len(body) > 0 {
-		if len(body) > 1000 {
-			msg.WriteString(fmt.Sprintf("Body (%d bytes): %s...\n", len(body), string(body[:1000])))
-		} else {
-			msg.WriteString("Body: " + string(body) + "\n")
-		}
+
+	bodyStr := string(body)
+	if len(body) > 1000 {
+		bodyStr = string(body[:1000]) + "..."
 	}
-	msg.WriteString("=============================\n")
-	writeLog(msg.String())
+
+	entry.Response = &logResp{
+		Status:  resp.StatusCode,
+		Headers: headers,
+		Body:    bodyStr,
+	}
+
+	logMutex.Lock()
+	defer logMutex.Unlock()
+
+	f, err := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	data, _ := json.Marshal(entry)
+	f.Write(data)
+	f.WriteString("\n")
 }
 
 func parseProxy(proxyString string) (ProxyParts, bool) {
