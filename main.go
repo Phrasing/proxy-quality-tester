@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"strconv"
@@ -19,27 +19,13 @@ import (
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/schollz/progressbar/v3"
+	"github.com/valyala/fastjson"
 )
 
-type APIResponse struct {
-	IP           string  `json:"ip"`
-	IsProxy      bool    `json:"is_proxy"`
-	IsVPN        bool    `json:"is_vpn"`
-	IsTor        bool    `json:"is_tor"`
-	IsDatacenter bool    `json:"is_datacenter"`
-	IsAbuser     bool    `json:"is_abuser"`
-	ElapsedMs    float64 `json:"elapsed_ms"`
-	Company      struct {
-		AbuserScore string `json:"abuser_score"`
-	} `json:"company"`
-	ASN struct {
-		Org string `json:"org"`
-	} `json:"asn"`
-	Location struct {
-		Country string `json:"country"`
-		City    string `json:"city"`
-	} `json:"location"`
-}
+var (
+	parserPool  fastjson.ParserPool
+	headerCache sync.Map
+)
 
 type ProxyResult struct {
 	Proxy            string
@@ -223,12 +209,11 @@ func writeCSVFile(filename string, proxies []ProxyResult) error {
 	}
 
 	for _, p := range proxies {
-		roundtripMs := float64(p.RoundtripLatency.Microseconds()) / 1000.0
 		record := []string{
 			p.Proxy,
 			p.IP,
 			fmt.Sprintf("%.2f", p.ElapsedMs),
-			fmt.Sprintf("%.2f", roundtripMs),
+			fmt.Sprintf("%.2f", float64(p.RoundtripLatency.Microseconds())/1000.0),
 			p.City,
 			p.ASNOrg,
 			fmt.Sprintf("%.4f", p.FraudScore),
@@ -244,6 +229,9 @@ func writeCSVFile(filename string, proxies []ProxyResult) error {
 func worker(ctx context.Context, proxyQueue <-chan string, results chan<- ProxyResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	p := parserPool.Get()
+	defer parserPool.Put(p)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -252,12 +240,12 @@ func worker(ctx context.Context, proxyQueue <-chan string, results chan<- ProxyR
 			if !ok {
 				return
 			}
-			results <- testProxy(proxy)
+			results <- testProxy(proxy, p)
 		}
 	}
 }
 
-func testProxy(proxyString string) ProxyResult {
+func testProxy(proxyString string, p *fastjson.Parser) ProxyResult {
 	res := ProxyResult{
 		Proxy:   proxyString,
 		Success: false,
@@ -269,8 +257,8 @@ func testProxy(proxyString string) ProxyResult {
 		return res
 	}
 
-	client, err := createTLSClient(
-		fmt.Sprintf("http://%s:%s@%s:%s", parts.User, parts.Pass, parts.Host, parts.Port))
+	proxyURL := "http://" + parts.User + ":" + parts.Pass + "@" + parts.Host + ":" + parts.Port
+	client, err := createTLSClient(proxyURL)
 	if err != nil {
 		return res
 	}
@@ -291,25 +279,15 @@ func testProxy(proxyString string) ProxyResult {
 		return res
 	}
 
-	var apiResp APIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return res
 	}
 
 	res.TotalBandwidth = client.GetBandwidthTracker().GetTotalBandwidth()
-	res.IP = apiResp.IP
 	res.RoundtripLatency = time.Since(start)
-	res.ElapsedMs = apiResp.ElapsedMs
-	res.City = apiResp.Location.City
-	res.ASNOrg = apiResp.ASN.Org
 
-	fraudScore, ok := parseFraudScore(apiResp.Company.AbuserScore)
-	if !ok {
-		return res
-	}
-	res.FraudScore = fraudScore
-
-	if !passesValidation(apiResp, fraudScore) {
+	if !parseAPIResponse(body, p, &res) {
 		return res
 	}
 
@@ -317,13 +295,51 @@ func testProxy(proxyString string) ProxyResult {
 	return res
 }
 
+func parseAPIResponse(body []byte, p *fastjson.Parser, res *ProxyResult) bool {
+	v, err := p.ParseBytes(body)
+	if err != nil {
+		return false
+	}
+
+	res.IP = string(v.GetStringBytes("ip"))
+	res.ElapsedMs = v.GetFloat64("elapsed_ms")
+
+	location := v.Get("location")
+	if location != nil {
+		res.City = string(location.GetStringBytes("city"))
+	}
+
+	asn := v.Get("asn")
+	if asn != nil {
+		res.ASNOrg = string(asn.GetStringBytes("org"))
+	}
+
+	company := v.Get("company")
+	if company == nil {
+		return false
+	}
+
+	abuserScore := string(company.GetStringBytes("abuser_score"))
+	fraudScore, ok := parseFraudScore(abuserScore)
+	if !ok {
+		return false
+	}
+	res.FraudScore = fraudScore
+
+	return passesValidationFast(v, fraudScore)
+}
+
 func parseFraudScore(abuserScore string) (float64, bool) {
-	fields := strings.Fields(abuserScore)
-	if len(fields) == 0 {
+	if len(abuserScore) == 0 {
 		return 0, false
 	}
 
-	score, err := strconv.ParseFloat(fields[0], 64)
+	end := strings.IndexByte(abuserScore, ' ')
+	if end == -1 {
+		end = len(abuserScore)
+	}
+
+	score, err := strconv.ParseFloat(abuserScore[:end], 64)
 	if err != nil {
 		return 0, false
 	}
@@ -331,8 +347,9 @@ func parseFraudScore(abuserScore string) (float64, bool) {
 	return score, true
 }
 
-func passesValidation(apiResp APIResponse, fraudScore float64) bool {
-	if apiResp.IsProxy || apiResp.IsVPN || apiResp.IsTor || apiResp.IsDatacenter || apiResp.IsAbuser {
+func passesValidationFast(v *fastjson.Value, fraudScore float64) bool {
+	if v.GetBool("is_proxy") || v.GetBool("is_vpn") || v.GetBool("is_tor") ||
+		v.GetBool("is_datacenter") || v.GetBool("is_abuser") {
 		return false
 	}
 
@@ -368,13 +385,11 @@ func createTLSClient(proxyURL string) (tlsclient.HttpClient, error) {
 	randomProfile := clientProfiles[rand.IntN(len(clientProfiles))]
 	profileVersion := randomProfile.GetClientHelloId().Version
 
-	options := []tlsclient.HttpClientOption{
-		tlsclient.WithTimeoutSeconds(requestTimeout),
-		tlsclient.WithClientProfile(randomProfile),
-		tlsclient.WithProxyUrl(proxyURL),
-		tlsclient.WithInsecureSkipVerify(),
-		tlsclient.WithBandwidthTracker(),
-		tlsclient.WithDefaultHeaders(http.Header{
+	var headers http.Header
+	if cached, ok := headerCache.Load(profileVersion); ok {
+		headers = cached.(http.Header)
+	} else {
+		headers = http.Header{
 			"accept":             {"*/*"},
 			"accept-encoding":    {"gzip, deflate, br, zstd"},
 			"accept-language":    {"en-US,en;q=0.9"},
@@ -384,8 +399,8 @@ func createTLSClient(proxyURL string) (tlsclient.HttpClient, error) {
 			"sec-fetch-dest":     {"empty"},
 			"sec-fetch-mode":     {"cors"},
 			"sec-fetch-site":     {"same-site"},
-			"user-agent":         {fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36", profileVersion)},
-			"sec-ch-ua":          {fmt.Sprintf(`"Google Chrome";v="%s", "Chromium";v="%s", "Not-A.Brand";v="99"`, profileVersion, profileVersion)},
+			"user-agent":         {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + profileVersion + ".0.0.0 Safari/537.36"},
+			"sec-ch-ua":          {`"Google Chrome";v="` + profileVersion + `", "Chromium";v="` + profileVersion + `", "Not-A.Brand";v="99"`},
 			"sec-ch-ua-mobile":   {"?0"},
 			"sec-ch-ua-platform": {`"Windows"`},
 			http.HeaderOrderKey: {
@@ -403,7 +418,17 @@ func createTLSClient(proxyURL string) (tlsclient.HttpClient, error) {
 				"sec-ch-ua-mobile",
 				"sec-ch-ua-platform",
 			},
-		}),
+		}
+		headerCache.Store(profileVersion, headers)
+	}
+
+	options := []tlsclient.HttpClientOption{
+		tlsclient.WithTimeoutSeconds(requestTimeout),
+		tlsclient.WithClientProfile(randomProfile),
+		tlsclient.WithProxyUrl(proxyURL),
+		tlsclient.WithInsecureSkipVerify(),
+		tlsclient.WithBandwidthTracker(),
+		tlsclient.WithDefaultHeaders(headers),
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }
@@ -430,9 +455,4 @@ func readProxies(filename string) ([]string, error) {
 	}
 
 	return proxies, scanner.Err()
-}
-
-func fatalError(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

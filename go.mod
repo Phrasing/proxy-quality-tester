@@ -4,7 +4,10 @@ go 1.24.1
 
 toolchain go1.24.10
 
-require github.com/schollz/progressbar/v3 v3.14.1
+require (
+	github.com/schollz/progressbar/v3 v3.14.1
+	github.com/valyala/fastjson v1.6.4
+)
 
 require (
 	github.com/bogdanfinn/quic-go-utls v1.0.4-utls // indirect
