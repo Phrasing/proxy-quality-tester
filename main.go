@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -24,151 +23,194 @@ import (
 	"github.com/valyala/fastjson"
 )
 
-var (
-	parserPool  fastjson.ParserPool
-	headerCache sync.Map
-)
+type Config struct {
+	InputFile      string
+	OutputFile     string
+	RequestFile    string
+	TargetURL      string
+	Timezone       string
+	RequestTimeout int
+	MaxFraudScore  float64
+	ASNFilter      int
+	DebugLog       bool
+}
+
+type Logger struct {
+	enabled bool
+	mu      sync.Mutex
+	pending sync.Map
+}
+
+type WorkerPool[I, O any] struct {
+	workers int
+	fn      func(I) (O, bool)
+}
 
 type ProxyResult struct {
-	Proxy            string
-	Success          bool
-	IP               string
-	TotalBandwidth   int64
-	RoundtripLatency time.Duration
-	ElapsedMs        float64
-	City             string
-	ASN              int
-	ASNOrg           string
-	FraudScore       float64
+	Proxy      string
+	IP         string
+	City       string
+	ASNOrg     string
+	ASN        int
+	Latency    time.Duration
+	Bandwidth  int64
+	FraudScore float64
+	Elapsed    float64
 }
 
 type ProxyParts struct {
-	Host string
-	Port string
-	User string
-	Pass string
-}
-
-type Stats struct {
-	SuccessCount   int64
-	FailureCount   int64
-	TotalBandwidth int64
+	Host, Port, User, Pass string
 }
 
 type CurlRequest struct {
-	URL     string
-	Method  string
-	Headers map[string]string
-	Body    string
+	URL, Method string
+	Headers     map[string]string
+	Body        string
 }
 
-const (
-	defaultInputFile     = "proxies.txt"
-	defaultOutputFile    = "results.csv"
-	defaultTimeout       = 5
-	defaultMaxFraudScore = 0.0005
-)
+type LogEntry struct {
+	Proxy string `json:"proxy"`
+	Time  string `json:"time"`
+	Req   LogReq `json:"request"`
+	Resp  LogReq `json:"response,omitempty"`
+}
+
+type LogReq struct {
+	Method string `json:"method,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Status int    `json:"status,omitempty"`
+	Head   any    `json:"headers,omitempty"`
+	Body   any    `json:"body,omitempty"`
+}
 
 var (
-	inputFile      string
-	outputFile     string
-	requestTimeout int
-	maxFraudScore  float64
-	requestFile    string
-	targetURL      string
-	asnFilter      int
-	debugLog       bool
-	logMutex       sync.Mutex
+	config         Config
+	logger         Logger
+	parserPool     fastjson.ParserPool
+	headerCache    sync.Map
+	clientProfiles = []profiles.ClientProfile{
+		profiles.Chrome_133_PSK, profiles.Chrome_131_PSK, profiles.Chrome_130_PSK,
+		profiles.Chrome_124, profiles.Chrome_120, profiles.Chrome_117,
+		profiles.Chrome_116_PSK, profiles.Chrome_112, profiles.Chrome_110,
+	}
 )
 
 func init() {
-	flag.StringVar(&inputFile, "input", defaultInputFile, "Input file containing proxies")
-	flag.StringVar(&outputFile, "output", defaultOutputFile, "Output CSV file for results")
-	flag.IntVar(&requestTimeout, "timeout", defaultTimeout, "Request timeout in seconds")
-	flag.Float64Var(&maxFraudScore, "max-fraud-score", defaultMaxFraudScore, "Maximum acceptable fraud score")
-	flag.StringVar(&requestFile, "request", "request.txt", "File containing curl command to test proxies against")
-	flag.StringVar(&targetURL, "target", "", "Target URL to test proxies against (overrides request file)")
-	flag.IntVar(&asnFilter, "asn", 0, "Filter proxies by ASN number (0 = no filter)")
-	flag.BoolVar(&debugLog, "debug", false, "Enable debug logging to debug.log")
-	flag.Parse()
+	flag.StringVar(&config.InputFile, "input", "proxies.txt", "Input file containing proxies")
+	flag.StringVar(&config.OutputFile, "output", "results.csv", "Output CSV file for results")
+	flag.IntVar(&config.RequestTimeout, "timeout", 5, "Request timeout in seconds")
+	flag.Float64Var(&config.MaxFraudScore, "max-fraud-score", 0.0005, "Maximum acceptable fraud score")
+	flag.StringVar(&config.RequestFile, "request", "request.txt", "File containing curl command to test proxies against")
+	flag.StringVar(&config.TargetURL, "target", "", "Target URL to test proxies against (overrides request file)")
+	flag.IntVar(&config.ASNFilter, "asn", 0, "Filter proxies by ASN number (0 = no filter)")
+	flag.StringVar(&config.Timezone, "timezone", "", "Filter proxies by timezone (e.g. 'America/New_York', 'EST', 'CET')")
+	flag.BoolVar(&config.DebugLog, "debug", false, "Enable debug logging to debug.jsonl")
 }
 
 func main() {
+	flag.Parse()
+	logger.enabled = config.DebugLog
 	start := time.Now()
 
-	proxies, err := readProxies(inputFile)
+	proxies, err := readProxies(config.InputFile)
 	if err != nil {
-		fmt.Printf("Error reading proxy file: %v", err)
+		fmt.Printf("Error reading proxies: %v\n", err)
 		return
 	}
-
 	if len(proxies) == 0 {
-		fmt.Println("No valid proxies found in", inputFile)
+		fmt.Println("No proxies found.")
 		return
 	}
 
 	fmt.Printf("Testing %d proxies...\n", len(proxies))
 
-	successful, stats := testProxies(proxies)
+	concurrency := min(len(proxies), 5000)
+	fmt.Printf("Using concurrency level: %d\n", concurrency)
 
-	displayStats(len(proxies), stats, time.Since(start))
+	pool := NewWorkerPool(concurrency, func(p string) (ProxyResult, bool) {
+		return testProxy(p)
+	})
+	results := pool.Run(proxies)
 
-	if len(successful) == 0 {
-		fmt.Println("\nNo working proxies found.")
+	printStats(len(proxies), results, time.Since(start))
+
+	if len(results) == 0 {
 		return
 	}
 
 	var curlReq CurlRequest
-	var hasTarget bool
+	hasTarget := false
 
-	if targetURL != "" {
-		curlReq = CurlRequest{
-			URL:     targetURL,
-			Method:  "GET",
-			Headers: make(map[string]string),
-		}
+	if config.TargetURL != "" {
+		curlReq = CurlRequest{URL: config.TargetURL, Method: "GET", Headers: make(map[string]string)}
 		hasTarget = true
-	} else if fileInfo, err := os.Stat(requestFile); err == nil && fileInfo.Size() > 0 {
-		var err error
-		curlReq, err = parseCurlFile(requestFile)
-		if err != nil {
-			fmt.Printf("Error parsing curl request: %v\n", err)
-			return
+	} else if fi, err := os.Stat(config.RequestFile); err == nil && fi.Size() > 0 {
+		if req, err := parseCurlFile(config.RequestFile); err == nil {
+			curlReq = req
+			hasTarget = true
+		} else {
+			fmt.Printf("Error parsing request file: %v\n", err)
 		}
-		hasTarget = true
 	}
 
 	if hasTarget {
-		fmt.Printf("\nTesting %d proxies against target...\n", len(successful))
-		successful = testProxiesAgainstTarget(successful, curlReq)
-		fmt.Printf("✓ %d passed target test\n", len(successful))
+		fmt.Printf("\nTesting %d proxies against target...\n", len(results))
+		targetPool := NewWorkerPool(concurrency, func(r ProxyResult) (ProxyResult, bool) {
+			if testProxyTarget(r.Proxy, curlReq) {
+				return r, true
+			}
+			return r, false
+		})
+		results = targetPool.Run(results)
+		fmt.Printf(" %d passed target test\n", len(results))
 	}
 
-	if len(successful) > 0 {
-		if err := writeCSVFile(outputFile, successful); err != nil {
-			fmt.Printf("Error writing CSV file: %v", err)
+	if len(results) > 0 {
+		if err := writeCSV(config.OutputFile, results); err != nil {
+			fmt.Printf("Error writing CSV: %v\n", err)
 			return
 		}
-		fmt.Printf("✓ Saved %d proxies to %s\n", len(successful), outputFile)
-	} else {
-		fmt.Println("\nNo proxies passed all tests.")
+		fmt.Printf("Saved to %s\n", config.OutputFile)
 	}
 }
 
-func testProxiesAgainstTarget(proxies []ProxyResult, curlReq CurlRequest) []ProxyResult {
-	type targetResult struct {
-		proxy   string
-		success bool
+func NewWorkerPool[I, O any](workers int, fn func(I) (O, bool)) *WorkerPool[I, O] {
+	return &WorkerPool[I, O]{
+		workers: workers,
+		fn:      fn,
+	}
+}
+
+func (wp *WorkerPool[I, O]) Run(items []I) []O {
+	total := len(items)
+	if wp.workers > total {
+		wp.workers = total
 	}
 
-	proxyQueue := make(chan string, len(proxies))
-	results := make(chan targetResult, len(proxies))
+	in := make(chan I, wp.workers*2)
+	out := make(chan O, wp.workers*2)
+	var wg sync.WaitGroup
+
+	go func() {
+		for _, item := range items {
+			in <- item
+		}
+		close(in)
+	}()
+
+	bar := progressbar.NewOptions(total,
+		progressbar.OptionSetDescription("Testing"),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWidth(10),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionSetRenderBlankState(true),
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	for i := 0; i < len(proxies); i++ {
+	for i := 0; i < wp.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -176,310 +218,120 @@ func testProxiesAgainstTarget(proxies []ProxyResult, curlReq CurlRequest) []Prox
 				select {
 				case <-ctx.Done():
 					return
-				case proxy, ok := <-proxyQueue:
+				case item, ok := <-in:
 					if !ok {
 						return
 					}
-					results <- targetResult{
-						proxy:   proxy,
-						success: testProxyTarget(proxy, curlReq),
+					if res, ok := wp.fn(item); ok {
+						out <- res
 					}
+					bar.Add(1)
 				}
 			}
 		}()
 	}
 
 	go func() {
-		for _, p := range proxies {
-			proxyQueue <- p.Proxy
-		}
-		close(proxyQueue)
+		wg.Wait()
+		close(out)
 	}()
 
-	bar := createProgressBar(len(proxies))
-
-	passedMap := make(map[string]bool)
-	var (
-		mu          sync.Mutex
-		collectorWg sync.WaitGroup
-	)
-	collectorWg.Add(1)
-
-	go func() {
-		defer collectorWg.Done()
-		for res := range results {
-			bar.Add(1)
-			if res.success {
-				mu.Lock()
-				passedMap[res.proxy] = true
-				mu.Unlock()
-			}
-		}
-	}()
-
-	wg.Wait()
-	close(results)
-	collectorWg.Wait()
+	var results []O
+	for res := range out {
+		results = append(results, res)
+	}
 	bar.Finish()
-
-	var passed []ProxyResult
-	for _, p := range proxies {
-		if passedMap[p.Proxy] {
-			passed = append(passed, p)
-		}
-	}
-
-	return passed
+	return results
 }
 
-func testProxies(proxies []string) ([]ProxyResult, Stats) {
-	proxyQueue := make(chan string, len(proxies))
-	results := make(chan ProxyResult, len(proxies))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	for i := 0; i < len(proxies); i++ {
-		wg.Add(1)
-		go worker(ctx, proxyQueue, results, &wg)
-	}
-
-	go func() {
-		for _, p := range proxies {
-			proxyQueue <- p
-		}
-		close(proxyQueue)
-	}()
-
-	bar := createProgressBar(len(proxies))
-
-	var (
-		successful  []ProxyResult
-		stats       Stats
-		mu          sync.Mutex
-		collectorWg sync.WaitGroup
-	)
-	collectorWg.Add(1)
-
-	go func() {
-		defer collectorWg.Done()
-		for res := range results {
-			bar.Add(1)
-			if res.Success {
-				atomic.AddInt64(&stats.SuccessCount, 1)
-				atomic.AddInt64(&stats.TotalBandwidth, res.TotalBandwidth)
-				mu.Lock()
-				successful = append(successful, res)
-				mu.Unlock()
-			} else {
-				atomic.AddInt64(&stats.FailureCount, 1)
-			}
-		}
-	}()
-
-	wg.Wait()
-	close(results)
-	collectorWg.Wait()
-	bar.Finish()
-
-	return successful, stats
-}
-
-func createProgressBar(total int) *progressbar.ProgressBar {
-	return progressbar.NewOptions(total,
-		progressbar.OptionSetDescription("Testing"),
-		progressbar.OptionShowCount(),
-		progressbar.OptionSetWidth(10),
-		progressbar.OptionSetPredictTime(false),
-		progressbar.OptionThrottle(65*time.Millisecond),
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionSetRenderBlankState(true),
-	)
-}
-
-func displayStats(totalTested int, stats Stats, elapsed time.Duration) {
-	fmt.Printf("\n✓ Completed in %s - %d/%d passed (%.1f%%) - %.1f MB bandwidth\n",
-		elapsed.Round(time.Millisecond), stats.SuccessCount, totalTested,
-		float64(stats.SuccessCount)/float64(totalTested)*100,
-		float64(stats.TotalBandwidth)/(1000*1000))
-}
-
-func writeCSVFile(filename string, proxies []ProxyResult) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(f)
-	defer w.Flush()
-
-	if err := w.Write([]string{
-		"proxy",
-		"ip",
-		"elapsed_ms",
-		"roundtrip_latency",
-		"city",
-		"asn",
-		"asn_org",
-		"fraud_score"}); err != nil {
-		return err
-	}
-
-	for _, p := range proxies {
-		record := []string{
-			p.Proxy,
-			p.IP,
-			fmt.Sprintf("%.2f", p.ElapsedMs),
-			fmt.Sprintf("%.2f", float64(p.RoundtripLatency.Microseconds())/1000.0),
-			p.City,
-			fmt.Sprintf("%d", p.ASN),
-			p.ASNOrg,
-			fmt.Sprintf("%.1f", p.FraudScore*1000),
-		}
-		if err := w.Write(record); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func worker(ctx context.Context, proxyQueue <-chan string, results chan<- ProxyResult, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	p := parserPool.Get()
-	defer parserPool.Put(p)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case proxy, ok := <-proxyQueue:
-			if !ok {
-				return
-			}
-			results <- testProxy(proxy, p)
-		}
-	}
-}
-
-func testProxy(proxyString string, p *fastjson.Parser) ProxyResult {
-	res := ProxyResult{
-		Proxy:   proxyString,
-		Success: false,
-		IP:      "",
-	}
-
-	parts, ok := parseProxy(proxyString)
+func testProxy(proxy string) (ProxyResult, bool) {
+	parts, ok := parseProxy(proxy)
 	if !ok {
-		return res
+		return ProxyResult{}, false
 	}
 
-	proxyURL := "http://" + parts.User + ":" + parts.Pass + "@" + parts.Host + ":" + parts.Port
-	client, headers, err := createTLSClient(proxyURL, "https://ipapi.is", "https://ipapi.is/", true)
+	client, headers, err := createTLSClient(buildProxyURL(parts), "https://ipapi.is", "https://ipapi.is/", true)
 	if err != nil {
-		return res
+		return ProxyResult{}, false
 	}
 
-	req, err := http.NewRequest("GET", "https://api.ipapi.is/", nil)
-	if err != nil {
-		return res
-	}
-
+	req, _ := http.NewRequest("GET", "https://api.ipapi.is/", nil)
 	applyHeaders(req, headers)
-	logRequest(proxyString, req, "")
+	logger.LogRequest(proxy, req, "")
 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return res
+		return ProxyResult{}, false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return res
+		return ProxyResult{}, false
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return res
+	body, _ := io.ReadAll(resp.Body)
+	logger.LogResponse(proxy, resp, body)
+
+	res := ProxyResult{
+		Proxy:     proxy,
+		Latency:   time.Since(start),
+		Bandwidth: client.GetBandwidthTracker().GetTotalBandwidth(),
 	}
 
-	logResponse(proxyString, resp, body)
-
-	res.TotalBandwidth = client.GetBandwidthTracker().GetTotalBandwidth()
-	res.RoundtripLatency = time.Since(start)
+	p := parserPool.Get()
+	defer parserPool.Put(p)
 
 	if !parseAPIResponse(body, p, &res) {
-		return res
+		return ProxyResult{}, false
 	}
-
-	res.Success = true
-	return res
+	return res, true
 }
 
-func testProxyTarget(proxyString string, curlReq CurlRequest) bool {
-	parts, ok := parseProxy(proxyString)
+func testProxyTarget(proxy string, curlReq CurlRequest) bool {
+	parts, ok := parseProxy(proxy)
 	if !ok {
 		return false
 	}
 
-	parsedURL, err := url.Parse(curlReq.URL)
+	parsed, err := url.Parse(curlReq.URL)
 	if err != nil {
 		return false
 	}
 
-	origin := parsedURL.Scheme + "://" + parsedURL.Host
-	referer := curlReq.Headers["referer"]
-	if referer == "" {
-		referer = origin + "/"
-	}
-
-	proxyURL := "http://" + parts.User + ":" + parts.Pass + "@" + parts.Host + ":" + parts.Port
-	client, baseHeaders, err := createTLSClient(proxyURL, origin, referer, false)
+	origin := parsed.Scheme + "://" + parsed.Host
+	client, headers, err := createTLSClient(buildProxyURL(parts), origin, origin+"/", false)
 	if err != nil {
 		return false
 	}
 
-	var bodyReader io.Reader
+	var body io.Reader
 	if curlReq.Body != "" {
-		bodyReader = strings.NewReader(curlReq.Body)
+		body = strings.NewReader(curlReq.Body)
 	}
 
-	method := curlReq.Method
-	if method == "" {
-		method = "GET"
-	}
-
-	req, err := http.NewRequest(method, curlReq.URL, bodyReader)
+	req, err := http.NewRequest(curlReq.Method, curlReq.URL, body)
 	if err != nil {
 		return false
 	}
 
-	applyHeaders(req, baseHeaders)
-	for key, value := range curlReq.Headers {
-		lowerKey := strings.ToLower(key)
-		if lowerKey != "user-agent" && !strings.HasPrefix(lowerKey, "sec-ch-ua") {
-			req.Header.Set(key, value)
+	applyHeaders(req, headers)
+	for k, v := range curlReq.Headers {
+		lk := strings.ToLower(k)
+		if lk != "user-agent" && !strings.HasPrefix(lk, "sec-ch-ua") {
+			req.Header.Set(k, v)
 		}
 	}
 
-	logRequest(proxyString, req, curlReq.Body)
-
+	logger.LogRequest(proxy, req, curlReq.Body)
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false
-	}
-
-	logResponse(proxyString, resp, body)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	logger.LogResponse(proxy, resp, bodyBytes)
 
 	return resp.StatusCode >= 200 && resp.StatusCode < 400
 }
@@ -490,179 +342,85 @@ func parseAPIResponse(body []byte, p *fastjson.Parser, res *ProxyResult) bool {
 		return false
 	}
 
-	res.IP = string(v.GetStringBytes("ip"))
-	res.ElapsedMs = v.GetFloat64("elapsed_ms")
-
-	location := v.Get("location")
-	if location != nil {
-		res.City = string(location.GetStringBytes("city"))
+	if !config.DebugLog && (v.GetBool("is_proxy") || v.GetBool("is_vpn") || v.GetBool("is_tor") ||
+		v.GetBool("is_datacenter") || v.GetBool("is_abuser")) {
+		return false
 	}
 
-	asn := v.Get("asn")
-	if asn != nil {
+	res.IP = string(v.GetStringBytes("ip"))
+	res.Elapsed = v.GetFloat64("elapsed_ms")
+	if loc := v.Get("location"); loc != nil {
+		res.City = string(loc.GetStringBytes("city"))
+	}
+	if asn := v.Get("asn"); asn != nil {
 		res.ASN = asn.GetInt("asn")
 		res.ASNOrg = string(asn.GetStringBytes("org"))
 	}
 
-	company := v.Get("company")
-	if company == nil {
-		return false
-	}
-
-	abuserScore := string(company.GetStringBytes("abuser_score"))
-	fraudScore, ok := parseFraudScore(abuserScore)
-	if !ok {
-		return false
-	}
-	res.FraudScore = fraudScore
-
-	return passesValidationFast(v, fraudScore, res.ASN)
-}
-
-func parseFraudScore(abuserScore string) (float64, bool) {
-	if end := strings.IndexByte(abuserScore, ' '); end > 0 {
-		abuserScore = abuserScore[:end]
-	}
-	if score, err := strconv.ParseFloat(abuserScore, 64); err == nil {
-		return score, true
-	}
-	return 0, false
-}
-
-func passesValidationFast(v *fastjson.Value, fraudScore float64, asn int) bool {
-	if !debugLog && (v.GetBool("is_proxy") || v.GetBool("is_vpn") || v.GetBool("is_tor") ||
-		v.GetBool("is_datacenter") || v.GetBool("is_abuser")) {
-		return false
-	}
-	return fraudScore <= maxFraudScore && (asnFilter == 0 || asn == asnFilter)
-}
-
-func applyHeaders(req *http.Request, headers http.Header) {
-	for key, values := range headers {
-		if key != http.HeaderOrderKey {
-			for _, value := range values {
-				req.Header.Add(key, value)
-			}
+	if config.Timezone != "" {
+		loc := v.Get("location")
+		if loc == nil {
+			return false
+		}
+		tz := string(loc.GetStringBytes("timezone"))
+		if !matchTimezone(tz, config.Timezone) {
+			return false
 		}
 	}
+
+	if company := v.Get("company"); company != nil {
+		scoreStr := string(company.GetStringBytes("abuser_score"))
+		if idx := strings.IndexByte(scoreStr, ' '); idx > 0 {
+			scoreStr = scoreStr[:idx]
+		}
+		if score, err := strconv.ParseFloat(scoreStr, 64); err == nil {
+			res.FraudScore = score
+		}
+	}
+
+	return res.FraudScore <= config.MaxFraudScore && (config.ASNFilter == 0 || res.ASN == config.ASNFilter)
 }
 
-type logEntry struct {
-	Proxy    string       `json:"proxy"`
-	Time     string       `json:"time"`
-	Request  logReq       `json:"request"`
-	Response *logResp     `json:"response,omitempty"`
+func matchTimezone(tz, filter string) bool {
+	if len(filter) == 0 {
+		return true
+	}
+
+	tz = strings.ToLower(tz)
+	filter = strings.ToLower(filter)
+
+	if strings.Contains(tz, filter) {
+		return true
+	}
+
+	switch filter {
+	case "est", "edt":
+		return strings.Contains(tz, "new_york") || strings.Contains(tz, "detroit") || strings.Contains(tz, "toronto")
+	case "cst", "cdt":
+		return strings.Contains(tz, "chicago") || strings.Contains(tz, "winnipeg")
+	case "mst", "mdt":
+		return strings.Contains(tz, "denver") || strings.Contains(tz, "edmonton")
+	case "pst", "pdt":
+		return strings.Contains(tz, "los_angeles") || strings.Contains(tz, "vancouver")
+	case "cet", "cest":
+		return strings.Contains(tz, "paris") || strings.Contains(tz, "berlin") || strings.Contains(tz, "rome") || strings.Contains(tz, "madrid")
+	case "gmt", "bst":
+		return strings.Contains(tz, "london") || strings.Contains(tz, "dublin")
+	case "utc":
+		return tz == "utc"
+	}
+
+	return false
 }
 
-type logReq struct {
-	Method  string            `json:"method"`
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body,omitempty"`
-}
+func createTLSClient(proxyURL, origin, referer string, track bool) (tlsclient.HttpClient, http.Header, error) {
+	profile := clientProfiles[rand.IntN(len(clientProfiles))]
+	ver := profile.GetClientHelloId().Version
 
-type logResp struct {
-	Status  int               `json:"status"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body,omitempty"`
-}
-
-var pendingRequests sync.Map
-
-func logRequest(proxy string, req *http.Request, reqBody string) {
-	if !debugLog {
-		return
-	}
-	headers := make(map[string]string)
-	for k, v := range req.Header {
-		headers[k] = strings.Join(v, ", ")
-	}
-	entry := &logEntry{
-		Proxy: proxy,
-		Time:  time.Now().Format(time.RFC3339),
-		Request: logReq{
-			Method:  req.Method,
-			URL:     req.URL.String(),
-			Headers: headers,
-			Body:    reqBody,
-		},
-	}
-	pendingRequests.Store(proxy, entry)
-}
-
-func logResponse(proxy string, resp *http.Response, body []byte) {
-	if !debugLog {
-		return
-	}
-	val, ok := pendingRequests.LoadAndDelete(proxy)
-	if !ok {
-		return
-	}
-	entry := val.(*logEntry)
-
-	headers := make(map[string]string)
-	for k, v := range resp.Header {
-		headers[k] = strings.Join(v, ", ")
-	}
-
-	bodyStr := string(body)
-	if len(body) > 1000 {
-		bodyStr = string(body[:1000]) + "..."
-	}
-
-	entry.Response = &logResp{
-		Status:  resp.StatusCode,
-		Headers: headers,
-		Body:    bodyStr,
-	}
-
-	logMutex.Lock()
-	defer logMutex.Unlock()
-
-	f, err := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	data, _ := json.Marshal(entry)
-	f.Write(data)
-	f.WriteString("\n")
-}
-
-func parseProxy(proxyString string) (ProxyParts, bool) {
-	parts := strings.Split(proxyString, ":")
-	if len(parts) != 4 {
-		return ProxyParts{}, false
-	}
-	return ProxyParts{
-		Host: parts[0],
-		Port: parts[1],
-		User: parts[2],
-		Pass: parts[3],
-	}, true
-}
-
-func createTLSClient(proxyURL string, origin string, referer string, trackBandwidth bool) (tlsclient.HttpClient, http.Header, error) {
-	clientProfiles := []profiles.ClientProfile{
-		profiles.Chrome_133_PSK,
-		profiles.Chrome_131_PSK,
-		profiles.Chrome_130_PSK,
-		profiles.Chrome_124,
-		profiles.Chrome_120,
-		profiles.Chrome_117,
-		profiles.Chrome_116_PSK,
-		profiles.Chrome_112,
-		profiles.Chrome_110,
-	}
-
-	randomProfile := clientProfiles[rand.IntN(len(clientProfiles))]
-	profileVersion := randomProfile.GetClientHelloId().Version
-
-	cacheKey := profileVersion + "|" + origin
+	key := ver + "|" + origin
 	var headers http.Header
-	if cached, ok := headerCache.Load(cacheKey); ok {
-		headers = cached.(http.Header)
+	if v, ok := headerCache.Load(key); ok {
+		headers = v.(http.Header)
 	} else {
 		headers = http.Header{
 			"accept":             {"*/*"},
@@ -674,189 +432,65 @@ func createTLSClient(proxyURL string, origin string, referer string, trackBandwi
 			"sec-fetch-dest":     {"empty"},
 			"sec-fetch-mode":     {"cors"},
 			"sec-fetch-site":     {"same-site"},
-			"user-agent":         {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + profileVersion + ".0.0.0 Safari/537.36"},
-			"sec-ch-ua":          {`"Google Chrome";v="` + profileVersion + `", "Chromium";v="` + profileVersion + `", "Not-A.Brand";v="99"`},
+			"user-agent":         {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + ver + ".0.0.0 Safari/537.36"},
+			"sec-ch-ua":          {`"Google Chrome";v="` + ver + `", "Chromium";v="` + ver + `", "Not-A.Brand";v="99"`},
 			"sec-ch-ua-mobile":   {"?0"},
 			"sec-ch-ua-platform": {`"Windows"`},
 			http.HeaderOrderKey: {
-				"accept",
-				"accept-encoding",
-				"accept-language",
-				"connection",
-				"origin",
-				"referer",
-				"sec-fetch-dest",
-				"sec-fetch-mode",
-				"sec-fetch-site",
-				"user-agent",
-				"sec-ch-ua",
-				"sec-ch-ua-mobile",
-				"sec-ch-ua-platform",
+				"accept", "accept-encoding", "accept-language", "connection", "origin", "referer",
+				"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "user-agent", "sec-ch-ua",
+				"sec-ch-ua-mobile", "sec-ch-ua-platform",
 			},
 		}
-		headerCache.Store(cacheKey, headers)
+		headerCache.Store(key, headers)
 	}
 
-	options := []tlsclient.HttpClientOption{
-		tlsclient.WithTimeoutSeconds(requestTimeout),
-		tlsclient.WithClientProfile(randomProfile),
+	opts := []tlsclient.HttpClientOption{
+		tlsclient.WithTimeoutSeconds(config.RequestTimeout),
+		tlsclient.WithClientProfile(profile),
 		tlsclient.WithProxyUrl(proxyURL),
 		tlsclient.WithInsecureSkipVerify(),
 		tlsclient.WithDefaultHeaders(headers),
 	}
-
-	if trackBandwidth {
-		options = append(options, tlsclient.WithBandwidthTracker())
+	if track {
+		opts = append(opts, tlsclient.WithBandwidthTracker())
 	}
-
-	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), opts...)
 	return client, headers, err
 }
 
-func parseCurlFile(filename string) (CurlRequest, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return CurlRequest{}, err
+func parseProxy(s string) (ProxyParts, bool) {
+	host, rest, ok1 := strings.Cut(s, ":")
+	port, rest, ok2 := strings.Cut(rest, ":")
+	user, pass, ok3 := strings.Cut(rest, ":")
+	if !ok1 || !ok2 || !ok3 || strings.Contains(pass, ":") {
+		return ProxyParts{}, false
 	}
-
-	curlCmd := string(data)
-	curlCmd = strings.ReplaceAll(curlCmd, "\\\n", " ")
-	curlCmd = strings.ReplaceAll(curlCmd, "^\n", " ")
-	curlCmd = strings.ReplaceAll(curlCmd, "^\r\n", " ")
-	curlCmd = strings.ReplaceAll(curlCmd, "\n", " ")
-	curlCmd = strings.ReplaceAll(curlCmd, "\r\n", " ")
-	curlCmd = strings.TrimSpace(curlCmd)
-
-	req := CurlRequest{
-		Method:  "GET",
-		Headers: make(map[string]string),
-	}
-
-	parts := parseCurlCommand(curlCmd)
-
-	for i := 0; i < len(parts); i++ {
-		part := parts[i]
-
-		if part == "curl" {
-			continue
-		}
-
-		if part == "-X" || part == "--request" {
-			if i+1 < len(parts) {
-				req.Method = parts[i+1]
-				i++
-			}
-			continue
-		}
-
-		if part == "-H" || part == "--header" {
-			if i+1 < len(parts) {
-				header := parts[i+1]
-				colonIdx := strings.Index(header, ":")
-				if colonIdx > 0 {
-					key := strings.TrimSpace(strings.Trim(header[:colonIdx], "^"))
-					value := strings.TrimSpace(strings.Trim(header[colonIdx+1:], "^"))
-					req.Headers[strings.ToLower(key)] = value
-				}
-				i++
-			}
-			continue
-		}
-
-		if part == "--data" || part == "--data-raw" || part == "--data-binary" || part == "-d" {
-			if i+1 < len(parts) {
-				req.Body = parts[i+1]
-				if req.Method == "GET" {
-					req.Method = "POST"
-				}
-				i++
-			}
-			continue
-		}
-
-		if !strings.HasPrefix(part, "-") && req.URL == "" {
-			req.URL = strings.Trim(part, "'\"^")
-		}
-	}
-
-	if req.URL == "" {
-		return CurlRequest{}, fmt.Errorf("no URL found in curl command")
-	}
-
-	return req, nil
+	return ProxyParts{host, port, user, pass}, true
 }
 
-func parseCurlCommand(cmd string) []string {
-	var parts []string
-	var current strings.Builder
-	inQuote := false
-	quoteChar := rune(0)
-	isBashQuote := false
+func buildProxyURL(p ProxyParts) string {
+	var sb strings.Builder
+	sb.Grow(10 + len(p.User) + len(p.Pass) + len(p.Host) + len(p.Port))
+	sb.WriteString("http://")
+	sb.WriteString(p.User)
+	sb.WriteByte(':')
+	sb.WriteString(p.Pass)
+	sb.WriteByte('@')
+	sb.WriteString(p.Host)
+	sb.WriteByte(':')
+	sb.WriteString(p.Port)
+	return sb.String()
+}
 
-	for i := 0; i < len(cmd); i++ {
-		c := rune(cmd[i])
-
-		if c == '$' && i+1 < len(cmd) && cmd[i+1] == '\'' && !inQuote {
-			isBashQuote = true
-			inQuote = true
-			quoteChar = '\''
-			i++
-			continue
-		}
-
-		if c == '\\' && inQuote && isBashQuote && i+1 < len(cmd) {
-			i++
-			next := rune(cmd[i])
-			switch next {
-			case 'n':
-				current.WriteRune('\n')
-			case 't':
-				current.WriteRune('\t')
-			case 'r':
-				current.WriteRune('\r')
-			case '\\':
-				current.WriteRune('\\')
-			case '\'':
-				current.WriteRune('\'')
-			default:
-				current.WriteRune('\\')
-				current.WriteRune(next)
+func applyHeaders(req *http.Request, headers http.Header) {
+	for k, v := range headers {
+		if k != http.HeaderOrderKey {
+			for _, val := range v {
+				req.Header.Add(k, val)
 			}
-			continue
-		}
-
-		if c == '\'' || c == '"' {
-			if !inQuote {
-				inQuote = true
-				quoteChar = c
-				isBashQuote = false
-			} else if c == quoteChar {
-				inQuote = false
-				quoteChar = 0
-				isBashQuote = false
-				if current.Len() > 0 {
-					parts = append(parts, current.String())
-					current.Reset()
-				}
-				continue
-			} else {
-				current.WriteRune(c)
-			}
-		} else if c == ' ' && !inQuote {
-			if current.Len() > 0 {
-				parts = append(parts, current.String())
-				current.Reset()
-			}
-		} else {
-			current.WriteRune(c)
 		}
 	}
-
-	if current.Len() > 0 {
-		parts = append(parts, current.String())
-	}
-
-	return parts
 }
 
 func readProxies(filename string) ([]string, error) {
@@ -865,20 +499,154 @@ func readProxies(filename string) ([]string, error) {
 		return nil, err
 	}
 	defer f.Close()
-
-	var proxies []string
-	scanner := bufio.NewScanner(f)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		if _, ok := parseProxy(line); ok {
-			proxies = append(proxies, line)
+	var lines []string
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		if t := strings.TrimSpace(s.Text()); t != "" && !strings.HasPrefix(t, "#") {
+			if _, ok := parseProxy(t); ok {
+				lines = append(lines, t)
+			}
 		}
 	}
+	return lines, s.Err()
+}
 
-	return proxies, scanner.Err()
+func writeCSV(filename string, proxies []ProxyResult) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	w.Write([]string{"proxy", "ip", "elapsed_ms", "latency_ms", "city", "asn", "asn_org", "fraud_score"})
+	for _, p := range proxies {
+		w.Write([]string{
+			p.Proxy, p.IP, fmt.Sprintf("%.2f", p.Elapsed),
+			fmt.Sprintf("%.2f", float64(p.Latency.Microseconds())/1000.0),
+			p.City, strconv.Itoa(p.ASN), p.ASNOrg, fmt.Sprintf("%.1f", p.FraudScore*1000),
+		})
+	}
+	w.Flush()
+	return w.Error()
+}
+
+func printStats(total int, results []ProxyResult, elapsed time.Duration) {
+	var bw int64
+	for _, r := range results {
+		bw += r.Bandwidth
+	}
+	fmt.Printf("\nCompleted in %s - %d/%d passed (%.1f%%) - %.1f MB bandwidth\n",
+		elapsed.Round(time.Millisecond), len(results), total,
+		float64(len(results))/float64(total)*100, float64(bw)/1e6)
+}
+
+func parseCurlFile(f string) (CurlRequest, error) {
+	b, err := os.ReadFile(f)
+	if err != nil {
+		return CurlRequest{}, err
+	}
+	cmd := strings.Join(strings.Fields(string(b)), " ")
+	return parseCurlArgs(parseBashArgs(cmd)), nil
+}
+
+func parseCurlArgs(args []string) CurlRequest {
+	req := CurlRequest{Method: "GET", Headers: make(map[string]string)}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-X", "--request":
+			if i+1 < len(args) {
+				req.Method = args[i+1]
+				i++
+			}
+		case "-H", "--header":
+			if i+1 < len(args) {
+				if k, v, ok := strings.Cut(args[i+1], ":"); ok {
+					req.Headers[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+				}
+				i++
+			}
+		case "-d", "--data", "--data-raw", "--data-binary":
+			if i+1 < len(args) {
+				req.Body = args[i+1]
+				if req.Method == "GET" {
+					req.Method = "POST"
+				}
+				i++
+			}
+		default:
+			if !strings.HasPrefix(args[i], "-") && req.URL == "" && args[i] != "curl" {
+				req.URL = strings.Trim(args[i], "'\"")
+			}
+		}
+	}
+	return req
+}
+
+func parseBashArgs(cmd string) []string {
+	var args []string
+	var buf strings.Builder
+	var quote rune
+	for _, r := range cmd {
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				buf.WriteRune(r)
+			}
+		} else if r == '\'' || r == '"' {
+			quote = r
+		} else if r == ' ' {
+			if buf.Len() > 0 {
+				args = append(args, buf.String())
+				buf.Reset()
+			}
+		} else {
+			buf.WriteRune(r)
+		}
+	}
+	if buf.Len() > 0 {
+		args = append(args, buf.String())
+	}
+	return args
+}
+
+func (l *Logger) LogRequest(proxy string, req *http.Request, body string) {
+	if !l.enabled {
+		return
+	}
+	h := make(map[string]string)
+	for k, v := range req.Header {
+		h[k] = strings.Join(v, ", ")
+	}
+	l.pending.Store(proxy, &LogEntry{
+		Proxy: proxy, Time: time.Now().Format(time.RFC3339),
+		Req: LogReq{Method: req.Method, URL: req.URL.String(), Head: h, Body: body},
+	})
+}
+
+func (l *Logger) LogResponse(proxy string, resp *http.Response, body []byte) {
+	if !l.enabled {
+		return
+	}
+	v, ok := l.pending.LoadAndDelete(proxy)
+	if !ok {
+		return
+	}
+	e := v.(*LogEntry)
+	h := make(map[string]string)
+	for k, v := range resp.Header {
+		h[k] = strings.Join(v, ", ")
+	}
+
+	e.Resp = LogReq{
+		Status: resp.StatusCode,
+		Head:   h,
+		Body:   body,
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	f, _ := os.OpenFile("debug.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer f.Close()
+	json.NewEncoder(f).Encode(e)
 }

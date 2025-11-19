@@ -24,6 +24,8 @@ proxy-quality-tester
 *.txt
 *.csv
 *.log
+*.json
+*.jsonl
 *.sh
 
 # IDE
